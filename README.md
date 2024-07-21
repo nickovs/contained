@@ -33,21 +33,32 @@ docker run -d --rm -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock --n
 
 ### Configuration
 
-By default `contained` is set up to run the provided files using a Python
-interpreter using a `python:alpine` image. It offers this service on port
-8080 and creates its own temporary volume for storing the uploaded files
-while they are in use. All of these features can be controlled using the
-following environment variables.
+By default `contained` is set up offer service on port 8080. It will run
+the provided files using a Python interpreter from a `python:alpine` image.
+It creates its own temporary volume for storing the uploaded files
+while they are in use. Code will be run as `nobody` with unlimited use of
+any available CPU cores for up to 60 seconds.
 
- * `SERVICE_PORT` may be set to specify a different port to the default 8080
- * `DOCKER_IMAGE` may be set to use a different Docker image to the
-   default `python:alpine`
- * `COMMAND_PREFIX` may be set to change what base command will be 
-   prepended to the arguments passed by the caller. By default, this will
-   be `python`.
- * `CONTAINED_USER` may be set to either a *numeric* UID or a pair of
-   *numeric* UID and GID separated by a colon. If this is not set then
-   both UID and GID default to 65534, the value for `nobody`.
+All of these features can be controlled using the following environment
+variables and settings:
+
+* `SERVICE_PORT` may be set to specify a different port to the default 8080
+* `DOCKER_IMAGE` may be set to use a different Docker image to the 
+default `python:alpine`
+* `COMMAND_PREFIX` may be set to change what base command will be 
+prepended to the arguments passed by the caller. By default, this will
+be `python`.
+* `CONTAINED_USER` may be set to either a *numeric* UID or a pair of
+*numeric* UID and GID separated by a colon. If this is not set then
+both UID and GID default to 65534, the value for `nobody`.
+* `CONTAINER_CPU_LIMIT` may be set to a floating point value for the
+maximum share of CPU cores that the code can use before being throttled.
+A zero value (or the variable not being set) means to explicit limit is
+applied.
+* `MAX_CONTAINER_RUN_TIME` may be set to an integer number of seconds
+to cap the execution time for a container. This represents the elapsed time,
+not the CPU time, so code that makes slow calls to the outside world might
+need a higher value. The default is 60 seconds.
 
 Additionally, if you prefer to create your own, persistent volume for the
 uploads then you can mount this when starting the container; it must be
@@ -128,8 +139,8 @@ in the event it has a bug, the scope for exploitation is limited.
 sub-container or what volumes get mounted on it.
  * A fresh container, with its own, isolated file space, is created for
 each call and destroyed afterward.
- * Container runs are time-limited (but not currently resource-limited
-during that time).
+ * Container runs are time-limited and may be constrained in the fraction
+of CPU capacity they have access to.
 
 Nonetheless, care should be taken when building Docker images for the
 runtime to ensure that you do not open up any new avenues by which

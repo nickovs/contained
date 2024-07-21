@@ -59,6 +59,8 @@ var dockerImageName string
 var commandPrefix []string
 var runAsUser int
 var runAsGroup int
+var containerCPULimit float64
+var maxContainerRunTime int
 
 //  Why doesn't Go have a ternary operator?
 
@@ -189,6 +191,12 @@ func runDocker(imageName string, files []JobFileItem, timeout int, args []string
 			},
 		}
 
+		if containerCPULimit != 0.0 {
+			hostConfig.Resources = container.Resources{
+				NanoCPUs: int64(containerCPULimit * 1_000_000_000),
+			}
+		}
+
 		resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, &network.NetworkingConfig{}, nil, "")
 		if err != nil {
 			return OutputJSON{outputs, rc, []string{err.Error()}}, err
@@ -317,7 +325,7 @@ func DockerJobHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(commandPrefix, args...)
 
-	result, err := runDocker(dockerImageName, job.Files, 30, args)
+	result, err := runDocker(dockerImageName, job.Files, maxContainerRunTime, args)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -337,30 +345,45 @@ func main() {
 	var err error
 	http.HandleFunc("/", DockerJobHandler)
 
+	tempMountDir = "/uploads"
+
 	port := getEnv("SERVICE_PORT", "8080")
 	dockerImageName = getEnv("DOCKER_IMAGE", "python:alpine")
 	commandPrefixString := getEnv("COMMAND_PREFIX", "python")
-	tempMountDir = "/uploads"
 	runAsUserString := getEnv("CONTAINED_USER", "65534")
+	containerCPULimitString := getEnv("CONTAINER_CPU_LIMIT", "0.0")
+	maxContainerRunTimeString := getEnv("MAX_CONTAINER_RUN_TIME", "60")
 
 	runUserParts := strings.Split(runAsUserString, ":")
 
 	partCount := len(runUserParts)
-	if partCount < 1 || partCount > 2 {
-		log.Fatalf("Invalid container user: %s", runUserParts)
-	}
-
-	runAsUser, err = strconv.Atoi(runUserParts[0])
-	if err != nil || runAsUser < 0 || runAsUser > 65534 {
-		log.Fatalf("User ID must be a valid number: %v", err)
-	}
-	if partCount == 2 {
+	switch partCount {
+	case 2:
 		runAsGroup, err = strconv.Atoi(runUserParts[1])
 		if err != nil || runAsGroup < 0 || runAsGroup > 65534 {
-			log.Fatalf("Group ID must be a valid number: %v", err)
+			log.Fatalf("Group ID must be a valid number: %s", runUserParts[1])
 		}
-	} else {
-		runAsGroup = runAsUser
+		fallthrough
+	case 1:
+		runAsUser, err = strconv.Atoi(runUserParts[0])
+		if err != nil || runAsUser < 0 || runAsUser > 65534 {
+			log.Fatalf("User ID must be a valid number: %s", runUserParts[0])
+		}
+		if partCount == 1 {
+			runAsGroup = runAsUser
+		}
+	default:
+		log.Fatalf("Invalid container user: %s", runAsUserString)
+	}
+
+	containerCPULimit, err := strconv.ParseFloat(containerCPULimitString, 64)
+	if err != nil || containerCPULimit < 0 || containerCPULimit > 64 {
+		log.Fatalf("Invalid CPU limit: %s (must be a positive float in range 0<=n<=64)", containerCPULimitString)
+	}
+
+	maxContainerRunTime, err = strconv.Atoi(maxContainerRunTimeString)
+	if err != nil || maxContainerRunTime < 0 || maxContainerRunTime > 3600 {
+		log.Fatalf("Invalid max container run time: %s (must be in in range 0<n<=3600)", maxContainerRunTimeString)
 	}
 
 	commandPrefix, err = shellwords.Parse(commandPrefixString)
@@ -373,9 +396,9 @@ func main() {
 		log.Fatalf("Failed to find mount: %v", err)
 	}
 
-	_, err = strconv.Atoi(port) // add this line to validate port is a valid integer.
-	if err != nil {
-		log.Fatalf("Invalid Port Number")
+	portNum, err := strconv.Atoi(port) // validate port is an integer.
+	if err != nil || portNum < 1 || portNum > 65535 {
+		log.Fatalf("Invalid port number: %s (most be int in range 0<n<65536)", port)
 	}
 
 	log.Printf("Listening on port %s", port)
