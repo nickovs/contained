@@ -17,6 +17,14 @@ Dockerfile. In most cases all you need to do is run:
 docker build --tag contained .
 ```
 
+If you don't want to build the image yourself, a pre-built image for
+`amd64` and `arm64` CPUs can be fetched from Docker Hub using:
+
+```shell
+docker pull nickovs/contained
+```
+
+
 ## Usage
 
 There are two critical command line (or `docker compose`) options that
