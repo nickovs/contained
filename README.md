@@ -24,7 +24,6 @@ If you don't want to build the image yourself, a pre-built image for
 docker pull nickovs/contained
 ```
 
-
 ## Usage
 
 There are two critical command line (or `docker compose`) options that
@@ -61,7 +60,7 @@ be `python`.
 both UID and GID default to 65534, the value for `nobody`.
 * `CONTAINER_CPU_LIMIT` may be set to a floating point value for the
 maximum share of CPU cores that the code can use before being throttled.
-A zero value (or the variable not being set) means to explicit limit is
+A zero value (or the variable not being set) means no explicit limit is
 applied.
 * `MAX_CONTAINER_RUN_TIME` may be set to an integer number of seconds
 to cap the execution time for a container. This represents the elapsed time,
@@ -76,12 +75,14 @@ are re-mounted into sub-containers.
 
 ### Request format
 
-Requests are made to the service by posting a JSON object to the `/` path.
-The request object contains two keys: 
+Requests are made to the service by posting a JSON object to either `/` or `/stream`.
+The only difference between the two endpoints is that the former returns the full results
+once the run completes while the later returns the results incrementally
+as they are generated. Either way, the request object contains two keys:
  * `files`: an array of object that represent the files to be uploaded, each one consisting of
    * `name`: the filename to give to the file
    * `text`: the file's text content
- * `args`. an optional list of command arguments.
+ * `args`: an optional list of command arguments.
 
 If the arguments are missing then the name of the first file in `files` will be used. For example:
 ```json
@@ -100,29 +101,48 @@ If the arguments are missing then the name of the first file in `files` will be 
 
 ### Response format
 
-When the container is successfully run the response will be a JSON object
-with three keys:
- * `outputs` is a list of output objects that each have three keys:
-   * `stream` is either `out` for lines from stdout or `err` for lines from stderr
-   * `ts` is the time (in seconds) since the container was started that the output line was captured
-   * `text` is the line (or lines) from the stream
- * `exitCode` is the return code from the process that was run in the container
- * `errors` is an optional list of strings of internal error messages
+For requests to the synchronous `/` endpoint, the response will be a JSON object
+with one key, `outputs`, which will contain a list of objects with the following
+keys:
+ * `type`: a string representing the type of the message. It will be one of
+`stdout`, `stderr`, `error` or `rc`
+ * `text`: a chunk of output text from either `stdout` or `stderr` in the case of those
+message types, or the text of an error message in the case of the `error` message type.
+ * `ts`: the time stamp of when a text chunk was captured from `stdout` or `stderr`,
+measured from the start of execution of the container.
+ * `code`: the numeric return code of the process that was run, used in the `rc` message.
+
+Note that due to the way optional numeric values in JSON are packed, if the return code from the
+process was zero then the `code` field may be missing, so a message of type `rc` without a the
+`code` field present indicates the process exited with a zero return code; this usually
+indicates success. Note also that the `rc` message is only produced if the user's code was run
+in the container. If this message is missing then errors occurred before the container was started.
 
 For example, successfully running the request above might yield:
 
 ```json
 {
-  "outputs": [
-    {
-      "stream": "out",
-      "ts": 0.099148375,
-      "text": "1.682941969615793\n"
-    }
-  ],
-  "exitCode": 0,
-  "errors": null
+   "outputs": [
+      {
+         "type": "output",
+         "stream": "out",
+         "ts": 0.094724125,
+         "text": "1.682941969615793\n"
+      },
+      {
+         "type": "rc"
+      }
+   ]
 }
+```
+
+When using the `/stream` endpoint the output is emitted incrementally, rather than after the
+process exits. In this case each of the elements of the `outputs` array described above are
+sent as JSON objects as they are generated, separated by new lines.
+
+```json lines
+{"type":"stdout","ts":0.098358375,"text":"1.682941969615793\n"}
+{"type":"rc"}
 ```
 
 ## Security considerations

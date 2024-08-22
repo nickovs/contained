@@ -29,16 +29,15 @@ import (
 	"github.com/mattn/go-shellwords"
 )
 
-type Output struct {
-	Stream    string  `json:"stream"`
-	TimeSince float64 `json:"ts"`
-	Line      string  `json:"text"`
+type StreamOutput struct {
+	Type      string  `json:"type"`
+	TimeSince float64 `json:"ts,omitempty"`
+	Text      string  `json:"text,omitempty"`
+	ExitCode  int     `json:"code,omitempty"`
 }
 
 type OutputJSON struct {
-	Outputs  []Output `json:"outputs"`
-	ExitCode int      `json:"exitCode"`
-	Errors   []string `json:"errors"`
+	Outputs []StreamOutput `json:"outputs"`
 }
 
 // DockerJob represents a job for the Docker executor.
@@ -122,184 +121,205 @@ func findMount(targetPath string) (string, error) {
 	return "", errors.New("mountInfo directory not found")
 }
 
-func runDocker(imageName string, files []JobFileItem, timeout int, args []string) (OutputJSON, error) {
-	var outputs []Output
-	var errorStack []string
-	var err error = nil
-	rc := -1
-
-	{
-		ctx := context.Background()
-		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+// saveTemporaryFiles saves the provided files as temporary files.
+// It returns either the path to the temporary files or an error
+// When a path is returned it is the callers responsibility to
+// clean up the directory.
+func saveTemporaryFiles(files []JobFileItem) (string, error) {
+	tmpDir, err := os.MkdirTemp(tempMountDir, "tmp")
+	if err != nil {
+		goto DONE
+	}
+	defer func() {
 		if err != nil {
-			return OutputJSON{outputs, rc, []string{err.Error()}}, err
-		}
-		defer func() {
-			_ = cli.Close()
-		}()
-
-		tmpDir, err := os.MkdirTemp(tempMountDir, "tmp")
-		if err != nil {
-			goto DONE
-		}
-		defer func() {
 			_ = os.RemoveAll(tmpDir)
-		}()
-
-		tempRelPath, _ := filepath.Rel(tempMountDir, tmpDir)
-
-		for itemIndex := range files {
-			item := files[itemIndex]
-			name := filepath.Clean(item.Name)
-			if name[:2] == ".." {
-				err = errors.New("invalid file path")
-			}
-			err = os.WriteFile(filepath.Join(tmpDir, name), []byte(item.Text), 0644)
-			if err != nil {
-				goto DONE
-			}
 		}
+	}()
 
-		err = filepath.Walk(tmpDir, func(filePath string, f os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			return os.Lchown(filePath, runAsUser, runAsGroup)
-		})
+	for itemIndex := range files {
+		item := files[itemIndex]
+		name := filepath.Clean(item.Name)
+		if name[:2] == ".." {
+			err = errors.New("invalid file path")
+		}
+		err = os.WriteFile(filepath.Join(tmpDir, name), []byte(item.Text), 0644)
 		if err != nil {
 			goto DONE
 		}
+	}
 
-		containerConfig := &container.Config{
-			Image:      imageName,
-			Cmd:        args,
-			Tty:        false,
-			WorkingDir: "/workdir",
-			User:       strconv.Itoa(runAsUser) + ":" + strconv.Itoa(runAsGroup),
-		}
-		hostConfig := &container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeVolume,
-					Source: tempMountVolume,
-					Target: "/workdir",
-					VolumeOptions: &mount.VolumeOptions{
-						NoCopy:  true,
-						Subpath: tempRelPath,
-					},
-				},
-			},
-		}
-
-		if containerCPULimit != 0.0 {
-			hostConfig.Resources = container.Resources{
-				NanoCPUs: int64(containerCPULimit * 1_000_000_000),
-			}
-		}
-
-		resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, &network.NetworkingConfig{}, nil, "")
+	err = filepath.Walk(tmpDir, func(filePath string, f os.FileInfo, err error) error {
 		if err != nil {
-			return OutputJSON{outputs, rc, []string{err.Error()}}, err
+			return err
 		}
-
-		defer func() {
-			_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		}()
-
-		startTime := time.Now()
-
-		if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-			return OutputJSON{outputs, rc, []string{err.Error()}}, err
-		}
-
-		outReader, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
-		if err != nil {
-			return OutputJSON{outputs, rc, []string{err.Error()}}, err
-		}
-		defer func() {
-			_ = outReader.Close()
-		}()
-
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		var readerErr error
-
-		go func() {
-			buf := make([]byte, 8)
-			for {
-				_, err := io.ReadFull(outReader, buf)
-				if err != nil && err != io.EOF {
-					readerErr = err
-					return
-				}
-
-				if err == io.EOF {
-					break
-				}
-
-				header := binary.BigEndian.Uint64(buf)
-				length := header & 0xFFFFFFFF
-				isStdErr := (header >> 56) == 2
-				now := time.Now()
-				elapsed := now.Sub(startTime)
-
-				data := make([]byte, length)
-				_, err = io.ReadFull(outReader, data)
-				if err != nil {
-					readerErr = err
-					return
-				}
-
-				output := Output{
-					Stream:    If(isStdErr, "err", "out"),
-					TimeSince: elapsed.Seconds(),
-					Line:      string(data),
-				}
-				outputs = append(outputs, output)
-			}
-
-			wg.Done()
-		}()
-
-		completionWaiter, errorWaiter := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-
-		select {
-		case <-time.After(time.Duration(timeout) * time.Second):
-			errorStack = append(errorStack, "Process timed out")
-			_ = cli.ContainerKill(ctx, resp.ID, "SIGKILL")
-
-		case response := <-completionWaiter:
-			rc = int(response.StatusCode)
-
-		case err = <-errorWaiter:
-			if err != nil {
-				errorStack = append(errorStack, err.Error())
-			}
-		}
-
-		wg.Wait()
-
-		if readerErr != nil {
-			errorStack = append(errorStack, readerErr.Error())
-		}
-
-		inspect, err := cli.ContainerInspect(ctx, resp.ID)
-		if err != nil {
-			errorStack = append(errorStack, err.Error())
-		} else {
-			rc = inspect.State.ExitCode
-		}
+		return os.Lchown(filePath, runAsUser, runAsGroup)
+	})
+	if err != nil {
+		goto DONE
 	}
 
 DONE:
 	if err != nil {
-		errorStack = append(errorStack, err.Error())
+		return "", err
+	} else {
+		return tmpDir, nil
 	}
-
-	return OutputJSON{outputs, rc, errorStack}, err
 }
 
-func DockerJobHandler(w http.ResponseWriter, r *http.Request) {
+func runDocker(outputChannel chan<- StreamOutput, imageName string, files []JobFileItem, timeout int, args []string) error {
+	var err error = nil
+	rc := -1
+
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		return err
+	}
+	defer func() {
+		_ = cli.Close()
+	}()
+
+	tmpDir, err := saveTemporaryFiles(files)
+	if err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		return err
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	tempRelPath, _ := filepath.Rel(tempMountDir, tmpDir)
+
+	containerConfig := &container.Config{
+		Image:      imageName,
+		Cmd:        args,
+		Tty:        false,
+		WorkingDir: "/workdir",
+		User:       strconv.Itoa(runAsUser) + ":" + strconv.Itoa(runAsGroup),
+	}
+	hostConfig := &container.HostConfig{
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeVolume,
+				Source: tempMountVolume,
+				Target: "/workdir",
+				VolumeOptions: &mount.VolumeOptions{
+					NoCopy:  true,
+					Subpath: tempRelPath,
+				},
+			},
+		},
+	}
+
+	if containerCPULimit != 0.0 {
+		hostConfig.Resources = container.Resources{
+			NanoCPUs: int64(containerCPULimit * 1_000_000_000),
+		}
+	}
+
+	resp, err := cli.ContainerCreate(ctx, containerConfig, hostConfig, &network.NetworkingConfig{}, nil, "")
+	if err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		return err
+	}
+
+	defer func() {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	}()
+
+	startTime := time.Now()
+
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		return err
+	}
+
+	outReader, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
+	if err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		return err
+	}
+	defer func() {
+		_ = outReader.Close()
+	}()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	var readerErr error
+
+	go func() {
+		buf := make([]byte, 8)
+		for {
+			_, err := io.ReadFull(outReader, buf)
+			if err != nil && err != io.EOF {
+				readerErr = err
+				return
+			}
+
+			if err == io.EOF {
+				break
+			}
+
+			header := binary.BigEndian.Uint64(buf)
+			length := header & 0xFFFFFFFF
+			isStdErr := (header >> 56) == 2
+			now := time.Now()
+			elapsed := now.Sub(startTime)
+
+			data := make([]byte, length)
+			_, err = io.ReadFull(outReader, data)
+			if err != nil {
+				readerErr = err
+				return
+			}
+
+			output := StreamOutput{
+				Type:      If(isStdErr, "stderr", "stdout"),
+				TimeSince: elapsed.Seconds(),
+				Text:      string(data),
+			}
+			outputChannel <- output
+		}
+
+		wg.Done()
+	}()
+
+	completionWaiter, errorWaiter := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+
+	select {
+	case <-time.After(time.Duration(timeout) * time.Second):
+		outputChannel <- StreamOutput{Type: "error", Text: "Process timed out"}
+		_ = cli.ContainerKill(ctx, resp.ID, "SIGKILL")
+
+	case response := <-completionWaiter:
+		rc = int(response.StatusCode)
+
+	case err = <-errorWaiter:
+		if err != nil {
+			outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+		}
+	}
+
+	wg.Wait()
+
+	if readerErr != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+	}
+
+	inspect, err := cli.ContainerInspect(ctx, resp.ID)
+	if err != nil {
+		outputChannel <- StreamOutput{Type: "error", Text: err.Error()}
+	} else {
+		rc = inspect.State.ExitCode
+	}
+
+	outputChannel <- StreamOutput{Type: "rc", ExitCode: rc}
+
+	return nil
+}
+
+func DockerJobHandler(w http.ResponseWriter, r *http.Request, streaming bool) {
 	var job DockerJob
 	var err error
 
@@ -325,13 +345,64 @@ func DockerJobHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(commandPrefix, args...)
 
-	result, err := runDocker(dockerImageName, job.Files, maxContainerRunTime, args)
+	resultChannel := make(chan StreamOutput)
 
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+	var serverError error
+	go func() {
+		serverError = runDocker(resultChannel, dockerImageName, job.Files, maxContainerRunTime, args)
+		close(resultChannel)
+	}()
+
+	// Create a new JSON encoder that writes to the response writer
+	encoder := json.NewEncoder(w)
+
+	if streaming {
+		// Set headers for streaming response
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+
+		for msg := range resultChannel {
+			err := encoder.Encode(msg)
+			if err != nil {
+				// If there's an error writing to the response, log it and break the loop
+				log.Printf("Error encoding message: %v", err)
+				break
+			}
+			// Flush the response writer to send the data immediately
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+
+		// Too late to set the header
+		if serverError != nil {
+			log.Printf("Server error: %v", serverError)
+		}
+	} else {
+		var results []StreamOutput
+
+		for msg := range resultChannel {
+			results = append(results, msg)
+		}
+
+		if serverError != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		err = encoder.Encode(OutputJSON{Outputs: results})
+		if err != nil {
+			log.Printf("Error encoding message: %v", err)
+		}
 	}
+}
 
-	_ = json.NewEncoder(w).Encode(result)
+func JSONDockerJobHandler(w http.ResponseWriter, r *http.Request) {
+	DockerJobHandler(w, r, false)
+}
+
+func StreamingDockerJobHandler(w http.ResponseWriter, r *http.Request) {
+	DockerJobHandler(w, r, true)
 }
 
 func getEnv(key, fallback string) string {
@@ -343,7 +414,8 @@ func getEnv(key, fallback string) string {
 
 func main() {
 	var err error
-	http.HandleFunc("/", DockerJobHandler)
+	http.HandleFunc("/", JSONDockerJobHandler)
+	http.HandleFunc("/stream", StreamingDockerJobHandler)
 
 	tempMountDir = "/uploads"
 
