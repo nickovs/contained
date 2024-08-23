@@ -15,6 +15,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: nickovs/contained
+          tags: |
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+            type=sha
+            type=raw,value=latest
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -26,4 +36,4 @@ jobs:
         with:
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: nickovs/contained:latest
+          tags: ${{ steps.meta.outputs.tags }}
